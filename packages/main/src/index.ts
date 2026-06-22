@@ -31,6 +31,8 @@ import {
     groupChatroomMessages,
 } from '@tinyagi/teams';
 
+const AGENT_INVOKE_TIMEOUT_MS = 5 * 60 * 1000;
+
 // Ensure directories exist
 [FILES_DIR, path.dirname(LOG_FILE)].forEach(dir => {
     if (!fs.existsSync(dir)) {
@@ -98,15 +100,33 @@ async function processMessage(dbMsg: any): Promise<void> {
     emitEvent('agent:invoke', { agentId, agentName: agent.name, fromAgent: data.fromAgent || null });
     let response: string;
     try {
-        response = await invokeAgent(agent, agentId, message, workspacePath, shouldReset, agents, teams, (text) => {
-            log('INFO', `Agent ${agentId}: ${text}`);
-            insertAgentMessage({ agentId, role: 'assistant', channel, sender: agentId, messageId, content: text });
-            emitEvent('agent:progress', { agentId, agentName: agent.name, text, messageId });
-            sendDirectResponse(text, {
-                channel, sender, senderId: data.senderId,
-                messageId, originalMessage: rawMessage, agentId,
-            });
+        let timeoutId: ReturnType<typeof setTimeout> | undefined;
+        const timeoutPromise = new Promise<never>((_, reject) => {
+            timeoutId = setTimeout(() => {
+                killAgentProcess(agentId);
+                reject(new Error(`Agent invocation timed out after ${AGENT_INVOKE_TIMEOUT_MS}ms`));
+            }, AGENT_INVOKE_TIMEOUT_MS);
+
+            // Prevent the timer from keeping the daemon alive on shutdown.
+            timeoutId.unref?.();
         });
+
+        try {
+            response = await Promise.race([
+                invokeAgent(agent, agentId, message, workspacePath, shouldReset, agents, teams, (text) => {
+                    log('INFO', `Agent ${agentId}: ${text}`);
+                    insertAgentMessage({ agentId, role: 'assistant', channel, sender: agentId, messageId, content: text });
+                    emitEvent('agent:progress', { agentId, agentName: agent.name, text, messageId });
+                    sendDirectResponse(text, {
+                        channel, sender, senderId: data.senderId,
+                        messageId, originalMessage: rawMessage, agentId,
+                    });
+                }),
+                timeoutPromise,
+            ]);
+        } finally {
+            if (timeoutId) clearTimeout(timeoutId);
+        }
     } catch (error) {
         const provider = agent.provider || 'anthropic';
         const providerLabel = provider === 'openai' ? 'Codex' : provider === 'opencode' ? 'OpenCode' : 'Claude';
